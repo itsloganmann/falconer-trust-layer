@@ -14,8 +14,12 @@ Based on "Mechanistic Auditing" research (NeurIPS 2025):
 import torch
 from torch import Tensor
 from typing import Dict, List, Tuple, Optional
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, asdict
 import warnings
+import json
+import os
+from datetime import datetime
+from pathlib import Path
 
 from colorama import Fore, Style, init as colorama_init
 
@@ -39,6 +43,165 @@ REVIEW_THRESHOLD = 0.60
 HALLUCINATION_RISK_THRESHOLD = 0.4
 DRIFT_DIVERGENCE_THRESHOLD = 0.1
 STUBBORN_DRIFT_THRESHOLD = 0.02
+
+
+# ============================================================================
+# GOOGLE DRIVE RESULTS SAVER
+# ============================================================================
+
+class DriveResultsSaver:
+    """
+    Saves trust analysis results to Google Drive in real-time.
+    
+    Usage in Colab:
+        from google.colab import drive
+        drive.mount('/content/drive')
+        saver = DriveResultsSaver('/content/drive/MyDrive/falconer_results')
+    """
+    
+    def __init__(self, save_dir: str = "/content/drive/MyDrive/falconer_results"):
+        """
+        Initialize the results saver.
+        
+        Args:
+            save_dir: Directory in Google Drive to save results.
+        """
+        self.save_dir = Path(save_dir)
+        self.save_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Create session directory with timestamp
+        self.session_id = datetime.now().strftime("%Y%m%d_%H%M%S")
+        self.session_dir = self.save_dir / f"session_{self.session_id}"
+        self.session_dir.mkdir(parents=True, exist_ok=True)
+        
+        # Initialize results log
+        self.results_log: List[Dict] = []
+        self.log_file = self.session_dir / "results_log.json"
+        self.summary_file = self.session_dir / "summary.txt"
+        
+        print(f"{Fore.GREEN}[✓] Drive saver initialized: {self.session_dir}")
+    
+    def _metric_to_dict(self, metric: 'TrustMetric', query: str, context: str) -> Dict:
+        """Convert TrustMetric to JSON-serializable dictionary."""
+        return {
+            "timestamp": datetime.now().isoformat(),
+            "query": query,
+            "context": context[:500] + "..." if len(context) > 500 else context,
+            "trust_score": metric.trust_score,
+            "status": "VERIFIED" if metric.is_verified else ("REVIEW" if metric.needs_review else "BLOCKED"),
+            "module_a_hallucination": {
+                "risk_score": metric.hallucination_risk,
+                "flagged_heads": [list(h) for h in metric.flagged_attention_heads[:10]],
+                "suppressed_tokens": metric.suppressed_tokens,
+            },
+            "module_b_causal_tracing": {
+                "critical_layer": metric.critical_layer,
+                "source_attributions": [
+                    {
+                        "source": attr.source_name,
+                        "line": attr.line_number,
+                        "impact": attr.causal_impact,
+                        "verified": attr.verified,
+                    }
+                    for attr in metric.source_attributions
+                ],
+                "layer_impacts": {str(k): v for k, v in list(metric.causal_impact_by_layer.items())[:10]},
+            },
+            "module_c_drift": {
+                "parametric_prediction": list(metric.parametric_prediction),
+                "contextual_prediction": list(metric.contextual_prediction),
+                "drift_type": metric.drift_type,
+                "drift_score": metric.drift_score,
+            },
+        }
+    
+    def save_result(self, metric: 'TrustMetric', query: str, context: str, scenario_name: str = "") -> str:
+        """
+        Save a single analysis result to Drive immediately.
+        
+        Args:
+            metric: The TrustMetric from analysis.
+            query: The query that was analyzed.
+            context: The context used.
+            scenario_name: Optional name for the scenario.
+            
+        Returns:
+            Path to the saved result file.
+        """
+        result = self._metric_to_dict(metric, query, context)
+        result["scenario_name"] = scenario_name
+        
+        # Add to log
+        self.results_log.append(result)
+        
+        # Save individual result
+        result_idx = len(self.results_log)
+        result_file = self.session_dir / f"result_{result_idx:03d}_{scenario_name.replace(' ', '_')}.json"
+        
+        with open(result_file, "w") as f:
+            json.dump(result, f, indent=2)
+        
+        # Update cumulative log
+        with open(self.log_file, "w") as f:
+            json.dump(self.results_log, f, indent=2)
+        
+        # Update summary
+        self._update_summary()
+        
+        print(f"{Fore.CYAN}    [💾] Saved to Drive: {result_file.name}")
+        
+        return str(result_file)
+    
+    def _update_summary(self):
+        """Update the summary text file."""
+        with open(self.summary_file, "w") as f:
+            f.write("=" * 70 + "\n")
+            f.write("FALCONER TRUST LAYER - ANALYSIS SUMMARY\n")
+            f.write(f"Session: {self.session_id}\n")
+            f.write("=" * 70 + "\n\n")
+            
+            verified = sum(1 for r in self.results_log if r["status"] == "VERIFIED")
+            review = sum(1 for r in self.results_log if r["status"] == "REVIEW")
+            blocked = sum(1 for r in self.results_log if r["status"] == "BLOCKED")
+            
+            f.write(f"Total Analyses: {len(self.results_log)}\n")
+            f.write(f"  ✓ Verified: {verified}\n")
+            f.write(f"  ! Review:   {review}\n")
+            f.write(f"  ✗ Blocked:  {blocked}\n\n")
+            
+            f.write("-" * 70 + "\n")
+            f.write("INDIVIDUAL RESULTS\n")
+            f.write("-" * 70 + "\n\n")
+            
+            for i, r in enumerate(self.results_log, 1):
+                f.write(f"{i}. {r.get('scenario_name', 'Query')}\n")
+                f.write(f"   Query: {r['query'][:60]}...\n" if len(r['query']) > 60 else f"   Query: {r['query']}\n")
+                f.write(f"   Trust Score: {r['trust_score']:.1%} | Status: {r['status']}\n")
+                f.write(f"   Hallucination Risk: {r['module_a_hallucination']['risk_score']:.3f}\n")
+                f.write(f"   Drift Type: {r['module_c_drift']['drift_type']}\n")
+                f.write("\n")
+    
+    def save_final_report(self) -> str:
+        """Save a final comprehensive report."""
+        report_file = self.session_dir / "FINAL_REPORT.txt"
+        
+        with open(report_file, "w") as f:
+            f.write("=" * 70 + "\n")
+            f.write("FALCONER TRUST LAYER - FINAL REPORT\n")
+            f.write(f"Generated: {datetime.now().isoformat()}\n")
+            f.write("=" * 70 + "\n\n")
+            
+            # Read and include summary
+            if self.summary_file.exists():
+                with open(self.summary_file, "r") as sf:
+                    f.write(sf.read())
+            
+            f.write("\n" + "=" * 70 + "\n")
+            f.write("END OF REPORT\n")
+            f.write("=" * 70 + "\n")
+        
+        print(f"\n{Fore.GREEN}[✓] Final report saved: {report_file}")
+        return str(report_file)
 
 
 @dataclass
@@ -457,21 +620,40 @@ Answer:"""
         print(f"\n{Fore.CYAN}{'═'*70}\n")
 
 
-def main() -> None:
+def main(save_to_drive: bool = True) -> None:
     """
     Main demonstration of the Falconer Trust Engine.
     
     Runs real-world scenarios with fresh vs stale context to demonstrate
     the drift detector and other mechanistic interpretability modules.
+    
+    Args:
+        save_to_drive: If True, saves results to Google Drive (requires mounted drive).
     """
     print(f"\n{Fore.MAGENTA}{Style.BRIGHT}{'='*70}")
     print(f"{Fore.MAGENTA}  FALCONER TRUST LAYER - Mechanistic Interpretability Demo")
     print(f"{Fore.MAGENTA}{'='*70}\n")
     
+    # ================================================================
+    # INITIALIZE GOOGLE DRIVE SAVER (if enabled)
+    # ================================================================
+    saver = None
+    if save_to_drive:
+        try:
+            # Check if running in Colab with Drive mounted
+            drive_path = "/content/drive/MyDrive"
+            if os.path.exists(drive_path):
+                saver = DriveResultsSaver(f"{drive_path}/falconer_results")
+            else:
+                print(f"{Fore.YELLOW}[!] Google Drive not mounted. Results will not be saved.")
+                print(f"{Fore.YELLOW}    To enable, run: from google.colab import drive; drive.mount('/content/drive')")
+        except Exception as e:
+            print(f"{Fore.YELLOW}[!] Could not initialize Drive saver: {e}")
+    
     # Initialize the engine (use gpt2-xl for demo, can swap to llama)
     # For Colab H100, you can use: "meta-llama/Meta-Llama-3-8B"
     engine = FalconerTrustEngine(
-        model_name="meta-llama/Meta-Llama-3-8B",  # Change to "meta-llama/Meta-Llama-3-8B" for production
+        model_name="gpt2-xl",  # Change to "meta-llama/Meta-Llama-3-8B" for production
         device="cuda",
         dtype=torch.float16,
     )
@@ -509,6 +691,10 @@ def main() -> None:
     
     engine.print_report(query_1, metric_1)
     
+    # Save to Drive
+    if saver:
+        saver.save_result(metric_1, query_1, fresh_context, "Fresh Context")
+    
     # ================================================================
     # SCENARIO 2: Stale Context (Should trigger drift detection)
     # ================================================================
@@ -541,6 +727,10 @@ def main() -> None:
     
     engine.print_report(query_2, metric_2)
     
+    # Save to Drive
+    if saver:
+        saver.save_result(metric_2, query_2, stale_context, "Stale Context")
+    
     # ================================================================
     # SCENARIO 3: Contradictory Context (Hallucination test)
     # ================================================================
@@ -568,6 +758,10 @@ def main() -> None:
     
     engine.print_report(query_3, metric_3)
     
+    # Save to Drive
+    if saver:
+        saver.save_result(metric_3, query_3, ambiguous_context, "Ambiguous Context")
+    
     # ================================================================
     # SUMMARY
     # ================================================================
@@ -590,6 +784,11 @@ def main() -> None:
             status = f"{Fore.RED}BLOCKED"
         
         print(f"  {name:20} -> Trust: {metric.trust_score:.1%} | Status: {status}{Style.RESET_ALL}")
+    
+    # Save final report to Drive
+    if saver:
+        saver.save_final_report()
+        print(f"\n{Fore.CYAN}[📁] All results saved to: {saver.session_dir}")
     
     print(f"\n{Fore.GREEN}{Style.BRIGHT}Analysis complete.")
     print(f"{Fore.WHITE}Powered by Falconer AI - Real Mechanistic Interpretability\n")
