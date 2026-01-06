@@ -259,7 +259,7 @@ class FalconerTrustEngine:
     
     def __init__(
         self,
-        model_name: str = "gpt2-xl",  # Use gpt2-xl for easier demo, swap to llama for production
+        model_name: str = "meta-llama/Meta-Llama-3-8B",  # Use gpt2-xl for easier demo, swap to llama for production
         device: str = "cuda",
         dtype: torch.dtype = torch.float16,
     ) -> None:
